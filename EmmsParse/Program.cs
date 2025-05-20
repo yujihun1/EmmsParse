@@ -3,7 +3,6 @@ using SharpPcap.LibPcap;
 using PacketDotNet;
 using System;
 using System.Data.SQLite;
-using System.Collections.Generic;
 using System.Text.RegularExpressions;
 
 class Program
@@ -193,6 +192,11 @@ class Program
         }
 
         // 패킷 정보 출력
+        if(srcPort != 102 && dstPort !=102)
+        {
+            return;
+        }
+        
         if (srcPort > 0 && dstPort > 0)
         {
             Console.WriteLine($"[{time:HH:mm:ss.fff}] {srcIP}:{srcPort} => {dstIP}:{dstPort} ({protocol})");
