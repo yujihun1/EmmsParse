@@ -4,22 +4,26 @@ using PacketDotNet;
 using System;
 using System.Data.SQLite;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 
 class Program
 {
-    static void Main()
+    static object consoleLock = new object();
+    static int packetCount = 0;
+    static CancellationTokenSource cts = new CancellationTokenSource();
+
+    static async Task Main()
     {
         Console.WriteLine("패킷 캡처 프로그램 시작...");
         Console.WriteLine($"SharpPcap 버전: {SharpPcap.Version.VersionString}");
 
-        // 모든 네트워크 어댑터 가져오기
         var devices = LibPcapLiveDeviceList.Instance;
 
         if (devices.Count < 1)
         {
             Console.WriteLine("사용 가능한 네트워크 어댑터가 없습니다.");
             Console.WriteLine("Npcap 또는 WinPcap이 설치되어 있는지 확인하세요.");
-            Console.WriteLine("다운로드: https://npcap.com");
             WaitForKeyPress();
             return;
         }
@@ -27,34 +31,26 @@ class Program
         // 어댑터 목록 표시
         Console.WriteLine("\n사용 가능한 네트워크 어댑터 목록:");
         Console.WriteLine("----------------------------------------");
-
         for (int i = 0; i < devices.Count; i++)
         {
             var dev = devices[i];
-            // 디바이스 이름에서 GUID 추출
             string guid = ExtractGuid(dev.Name);
             Console.WriteLine($"{i}: {dev.Description} [{guid}]");
 
-            // 어댑터의 네트워크 주소 표시 (있을 경우)
-            if (dev.Addresses.Count > 0)
+            foreach (var addr in dev.Addresses)
             {
-                foreach (var addr in dev.Addresses)
+                if (addr.Addr?.ipAddress != null)
                 {
-                    if (addr.Addr != null && addr.Addr.ipAddress != null)
-                    {
-                        Console.WriteLine($"   IP: {addr.Addr.ipAddress}");
-                    }
+                    Console.WriteLine($"   IP: {addr.Addr.ipAddress}");
                 }
             }
         }
 
         Console.WriteLine("----------------------------------------");
         Console.Write("사용할 어댑터 번호를 입력하세요: ");
-
         int selectedIndex;
         while (!int.TryParse(Console.ReadLine(), out selectedIndex) ||
-               selectedIndex < 0 ||
-               selectedIndex >= devices.Count)
+               selectedIndex < 0 || selectedIndex >= devices.Count)
         {
             Console.Write("올바른 어댑터 번호를 입력하세요: ");
         }
@@ -64,25 +60,23 @@ class Program
 
         try
         {
-            // 어댑터 열기 전에 상태 확인
-            Console.WriteLine("어댑터 열기 시도 중...");
-
-            // 패킷 필터 설정 (옵션) - TCP 및 UDP 패킷만 캡처
             string filter = "tcp or udp";
-
-            // 어댑터 열기
-            int readTimeoutMilliseconds = 1000;
-            selectedDevice.Open(DeviceMode.Normal, readTimeoutMilliseconds);
-            Console.WriteLine("어댑터가 성공적으로 열렸습니다.");
-
-            // 필터 설정 (필요한 경우)
+            selectedDevice.Open(DeviceMode.Normal, 1000);
             selectedDevice.Filter = filter;
             Console.WriteLine($"필터가 설정되었습니다: {filter}");
 
-            // 패킷 도착 이벤트 핸들러 등록
-            selectedDevice.OnPacketArrival += new PacketArrivalEventHandler(Device_OnPacketArrival);
+            selectedDevice.OnPacketArrival += (sender, e) =>
+            {
+                var packet = Packet.ParsePacket(e.Packet.LinkLayerType, e.Packet.Data);
+                var ipv4 = packet.Extract<IPv4Packet>();
+                var ipv6 = packet.Extract<IPv6Packet>();
 
-            // 설정 저장 시도
+                if (ipv4 != null)
+                    ProcessIPPacket(ipv4, e.Packet.Timeval.Date);
+                else if (ipv6 != null)
+                    ProcessIPPacket(ipv6, e.Packet.Timeval.Date);
+            };
+
             try
             {
                 SaveToSQLite(selectedDevice.Name);
@@ -90,76 +84,62 @@ class Program
             catch (Exception ex)
             {
                 Console.WriteLine("설정 저장 중 오류: " + ex.Message);
-                // 설정 저장 실패해도 계속 진행
             }
 
-            // 패킷 캡처 시작
-            Console.WriteLine("\n패킷 캡처를 시작합니다. 중지하려면 Ctrl + C를 누르세요.");
-            selectedDevice.StartCapture();
-
             // Ctrl+C 처리
-            Console.CancelKeyPress += (sender, e) =>
+            Console.CancelKeyPress += (s, e) =>
             {
-                e.Cancel = true; // 프로그램 종료 방지
-                Console.WriteLine("\n캡처 중지 중...");
+                e.Cancel = true;
+                Console.WriteLine("\nCtrl+C 감지됨. 캡처 중지 중...");
+                cts.Cancel();
+            };
+
+            Console.WriteLine("\n패킷 캡처를 시작합니다. 중지하려면 Ctrl + C를 누르세요.");
+
+            Task captureTask = Task.Run(() =>
+            {
                 try
                 {
+                    selectedDevice.StartCapture();
+                    while (!cts.Token.IsCancellationRequested)
+                        Thread.Sleep(500);
                     selectedDevice.StopCapture();
                     selectedDevice.Close();
-                    Console.WriteLine("캡처가 중지되었습니다.");
+                    lock (consoleLock)
+                    {
+                        Console.WriteLine("캡처가 중지되었습니다.");
+                    }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("캡처 중지 오류: " + ex.Message);
+                    Console.WriteLine("캡처 오류: " + ex.Message);
                 }
+            }, cts.Token);
 
-                Environment.Exit(0);
-            };
+            // @ 표시 Task (다른 비동기 작업 시뮬레이션)
+            Task printerTask = Task.Run(async () =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    await Task.Delay(2000);
+                    lock (consoleLock)
+                    {
+                        Console.WriteLine("@@@@@@@@@@@@@@@@ [알림 Task] @@@@@@@@@@@@@@@@");
+                    }
+                }
+            }, cts.Token);
 
-            // 메인 스레드 대기
-            System.Threading.Thread.Sleep(System.Threading.Timeout.Infinite);
+            await Task.WhenAll(captureTask, printerTask);
         }
         catch (Exception ex)
         {
             Console.WriteLine("어댑터 열기 실패: " + ex.Message);
-            Console.WriteLine("상세 정보: " + ex.ToString());
-
             Console.WriteLine("\n문제 해결 방법:");
-            Console.WriteLine("1. 프로그램을 관리자 권한으로 실행하세요.");
-            Console.WriteLine("2. Npcap이 제대로 설치되어 있는지 확인하세요. (https://npcap.com)");
-            Console.WriteLine("3. 다른 어댑터를 선택해 보세요.");
-            Console.WriteLine("4. 방화벽이 프로그램을 차단하고 있지 않은지 확인하세요.");
-
+            Console.WriteLine("1. 관리자 권한으로 실행");
+            Console.WriteLine("2. Npcap 설치 확인: https://npcap.com");
+            Console.WriteLine("3. 다른 어댑터 선택");
+            Console.WriteLine("4. 방화벽 설정 확인");
             WaitForKeyPress();
-        }
-    }
-
-    static void Device_OnPacketArrival(object sender, CaptureEventArgs e)
-    {
-        try
-        {
-            // 패킷 파싱
-            var packet = Packet.ParsePacket(e.Packet.LinkLayerType, e.Packet.Data);
-
-            // IPv4 패킷 처리
-            var ipv4Packet = packet.Extract<IPv4Packet>();
-            if (ipv4Packet != null)
-            {
-                ProcessIPPacket(ipv4Packet, e.Packet.Timeval.Date);
-                return;
-            }
-
-            // IPv6 패킷 처리
-            var ipv6Packet = packet.Extract<IPv6Packet>();
-            if (ipv6Packet != null)
-            {
-                ProcessIPPacket(ipv6Packet, e.Packet.Timeval.Date);
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"패킷 처리 오류: {ex.Message}");
         }
     }
 
@@ -171,39 +151,30 @@ class Program
         int srcPort = 0;
         int dstPort = 0;
 
-        // TCP 패킷 처리
-        var tcpPacket = ipPacket.Extract<TcpPacket>();
-        if (tcpPacket != null)
+        var tcp = ipPacket.Extract<TcpPacket>();
+        var udp = ipPacket.Extract<UdpPacket>();
+
+        if (tcp != null)
         {
             protocol = "TCP";
-            srcPort = tcpPacket.SourcePort;
-            dstPort = tcpPacket.DestinationPort;
+            srcPort = tcp.SourcePort;
+            dstPort = tcp.DestinationPort;
         }
-        else
+        else if (udp != null)
         {
-            // UDP 패킷 처리
-            var udpPacket = ipPacket.Extract<UdpPacket>();
-            if (udpPacket != null)
-            {
-                protocol = "UDP";
-                srcPort = udpPacket.SourcePort;
-                dstPort = udpPacket.DestinationPort;
-            }
+            protocol = "UDP";
+            srcPort = udp.SourcePort;
+            dstPort = udp.DestinationPort;
         }
 
-        // 패킷 정보 출력
-        if(srcPort != 102 && dstPort !=102)
+        if (srcPort == 102 || dstPort == 102)
         {
-            return;
-        }
-        
-        if (srcPort > 0 && dstPort > 0)
-        {
-            Console.WriteLine($"[{time:HH:mm:ss.fff}] {srcIP}:{srcPort} => {dstIP}:{dstPort} ({protocol})");
-        }
-        else
-        {
-            Console.WriteLine($"[{time:HH:mm:ss.fff}] {srcIP} => {dstIP} ({protocol})");
+            packetCount++;
+            lock (consoleLock)
+            {
+                Console.WriteLine($"[{time:HH:mm:ss.fff}] {srcIP}:{srcPort} => {dstIP}:{dstPort} ({protocol})");
+                Console.WriteLine("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+            }
         }
     }
 
@@ -232,16 +203,9 @@ class Program
 
     static string ExtractGuid(string deviceName)
     {
-        // 디바이스 이름에서 GUID 추출 (예: \Device\NPF_{442BE5EB-87B2-432A-BD62-2ACDB5F30BC5})
         Regex guidRegex = new Regex(@"\{([A-F0-9\-]+)\}");
         Match match = guidRegex.Match(deviceName);
-
-        if (match.Success && match.Groups.Count > 1)
-        {
-            return match.Groups[1].Value;
-        }
-
-        return "Unknown";
+        return match.Success ? match.Groups[1].Value : "Unknown";
     }
 
     static void WaitForKeyPress()
