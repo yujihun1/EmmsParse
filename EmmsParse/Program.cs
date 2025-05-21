@@ -23,40 +23,61 @@ class Program
         if (devices.Count < 1)
         {
             Console.WriteLine("사용 가능한 네트워크 어댑터가 없습니다.");
-            Console.WriteLine("Npcap 또는 WinPcap이 설치되어 있는지 확인하세요.");
             WaitForKeyPress();
             return;
         }
 
-        // 어댑터 목록 표시
-        Console.WriteLine("\n사용 가능한 네트워크 어댑터 목록:");
-        Console.WriteLine("----------------------------------------");
-        for (int i = 0; i < devices.Count; i++)
-        {
-            var dev = devices[i];
-            string guid = ExtractGuid(dev.Name);
-            Console.WriteLine($"{i}: {dev.Description} [{guid}]");
+        // DB에서 자동으로 사용할 디바이스 이름 가져오기
+        string savedDeviceName = LoadDeviceNameFromSQLite();
+        LibPcapLiveDevice selectedDevice = null;
 
-            foreach (var addr in dev.Addresses)
+        if (!string.IsNullOrEmpty(savedDeviceName))
+        {
+            selectedDevice = FindDeviceByName(devices, savedDeviceName);
+            if (selectedDevice != null)
             {
-                if (addr.Addr?.ipAddress != null)
-                {
-                    Console.WriteLine($"   IP: {addr.Addr.ipAddress}");
-                }
+                Console.WriteLine($"\nDB에 저장된 어댑터 자동 선택: {selectedDevice.Description}");
             }
         }
 
-        Console.WriteLine("----------------------------------------");
-        Console.Write("사용할 어댑터 번호를 입력하세요: ");
-        int selectedIndex;
-        while (!int.TryParse(Console.ReadLine(), out selectedIndex) ||
-               selectedIndex < 0 || selectedIndex >= devices.Count)
+        // DB에 저장된 장치가 없거나 찾지 못했을 경우 수동 선택
+        if (selectedDevice == null)
         {
-            Console.Write("올바른 어댑터 번호를 입력하세요: ");
-        }
+            Console.WriteLine("\n사용 가능한 네트워크 어댑터 목록:");
+            Console.WriteLine("----------------------------------------");
+            for (int i = 0; i < devices.Count; i++)
+            {
+                var dev = devices[i];
+                string guid = ExtractGuid(dev.Name);
+                Console.WriteLine($"{i}: {dev.Description} [{guid}]");
 
-        var selectedDevice = devices[selectedIndex] as LibPcapLiveDevice;
-        Console.WriteLine($"\n선택한 어댑터: {selectedDevice.Description}");
+                foreach (var addr in dev.Addresses)
+                {
+                    if (addr.Addr?.ipAddress != null)
+                        Console.WriteLine($"   IP: {addr.Addr.ipAddress}");
+                }
+            }
+
+            Console.WriteLine("----------------------------------------");
+            Console.Write("사용할 어댑터 번호를 입력하세요: ");
+            int selectedIndex;
+            while (!int.TryParse(Console.ReadLine(), out selectedIndex) || selectedIndex < 0 || selectedIndex >= devices.Count)
+            {
+                Console.Write("올바른 어댑터 번호를 입력하세요: ");
+            }
+
+            selectedDevice = devices[selectedIndex] as LibPcapLiveDevice;
+            Console.WriteLine($"\n선택한 어댑터: {selectedDevice.Description}");
+
+            try
+            {
+                SaveToSQLite(selectedDevice.Name);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("설정 저장 중 오류: " + ex.Message);
+            }
+        }
 
         try
         {
@@ -77,16 +98,6 @@ class Program
                     ProcessIPPacket(ipv6, e.Packet.Timeval.Date);
             };
 
-            try
-            {
-                SaveToSQLite(selectedDevice.Name);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("설정 저장 중 오류: " + ex.Message);
-            }
-
-            // Ctrl+C 처리
             Console.CancelKeyPress += (s, e) =>
             {
                 e.Cancel = true;
@@ -116,7 +127,6 @@ class Program
                 }
             }, cts.Token);
 
-            // @ 표시 Task (다른 비동기 작업 시뮬레이션)
             Task printerTask = Task.Run(async () =>
             {
                 while (!cts.Token.IsCancellationRequested)
@@ -134,11 +144,6 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine("어댑터 열기 실패: " + ex.Message);
-            Console.WriteLine("\n문제 해결 방법:");
-            Console.WriteLine("1. 관리자 권한으로 실행");
-            Console.WriteLine("2. Npcap 설치 확인: https://npcap.com");
-            Console.WriteLine("3. 다른 어댑터 선택");
-            Console.WriteLine("4. 방화벽 설정 확인");
             WaitForKeyPress();
         }
     }
@@ -173,7 +178,7 @@ class Program
             lock (consoleLock)
             {
                 Console.WriteLine($"[{time:HH:mm:ss.fff}] {srcIP}:{srcPort} => {dstIP}:{dstPort} ({protocol})");
-                Console.WriteLine("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                Console.WriteLine(new string('@', 30));
             }
         }
     }
@@ -184,21 +189,50 @@ class Program
         conn.Open();
 
         var cmd = new SQLiteCommand(@"
-        CREATE TABLE IF NOT EXISTS nms_config (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_name TEXT NOT NULL
-        );", conn);
+            CREATE TABLE IF NOT EXISTS nms_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_name TEXT NOT NULL
+            );", conn);
         cmd.ExecuteNonQuery();
-        cmd.Dispose();
+
+        var delCmd = new SQLiteCommand("DELETE FROM nms_config;", conn);
+        delCmd.ExecuteNonQuery();
 
         var insertCmd = new SQLiteCommand("INSERT INTO nms_config(device_name) VALUES (@name);", conn);
         insertCmd.Parameters.AddWithValue("@name", deviceName);
         insertCmd.ExecuteNonQuery();
-        insertCmd.Dispose();
 
         conn.Close();
-        conn.Dispose();
         Console.WriteLine("설정이 저장되었습니다.");
+    }
+
+    static string LoadDeviceNameFromSQLite()
+    {
+        try
+        {
+            var conn = new SQLiteConnection("Data Source=config.db");
+            conn.Open();
+
+            var cmd = new SQLiteCommand("SELECT device_name FROM nms_config ORDER BY id DESC LIMIT 1;", conn);
+            var result = cmd.ExecuteScalar()?.ToString();
+            conn.Close();
+            return result;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("SQLite 읽기 오류: " + ex.Message);
+            return null;
+        }
+    }
+
+    static LibPcapLiveDevice FindDeviceByName(LibPcapLiveDeviceList devices, string deviceName)
+    {
+        foreach (var dev in devices)
+        {
+            if (dev.Name == deviceName)
+                return dev;
+        }
+        return null;
     }
 
     static string ExtractGuid(string deviceName)
